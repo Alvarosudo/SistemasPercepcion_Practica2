@@ -1,14 +1,8 @@
 import open3d as o3d
 import numpy as np
 
-# ─── Configuración central ───────────────────────────────────────────────────
-VOXEL_SIZE_SCENE  = 0.005
-VOXEL_SIZE_OBJECT = 0.001
-FPFH_RADIUS       = 0.015
-NORMAL_RADIUS     = 0.01
-
+# Configuración de rutas
 SCENE_PATH = "clouds/scenes/snap_0point.pcd"
-
 OBJECT_PATHS = {
     "mug":       "clouds/objects/s0_mug_corr.pcd",
     "piggybank": "clouds/objects/s0_piggybank_corr.pcd",
@@ -16,94 +10,77 @@ OBJECT_PATHS = {
     "plc":       "clouds/objects/s0_plc_corr.pcd",
 }
 
-# ─── Pasos 1-4 (igual que antes) ─────────────────────────────────────────────
-def preprocess_scene(pcd_path, voxel_size):
-    pcd = o3d.io.read_point_cloud(pcd_path)
-    print(f"[scene | load]  {len(pcd.points):,} puntos originales")
-    pcd_down = pcd.voxel_down_sample(voxel_size=voxel_size)
-    print(f"[scene | voxel] {len(pcd_down.points):,} puntos tras downsampling")
+def remove_planes(pcd):
+    """ Segmenta y elimina el plano de la mesa """
+    _, inliers = pcd.segment_plane(0.01, 3, 1000)
+    return pcd.select_by_index(inliers, invert=True)
+
+def preprocess(pcd, voxel_size):
+    """ Downsampling, normales y descriptores FPFH """
+    pcd_down = pcd.voxel_down_sample(voxel_size)
     pcd_down.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(
-            radius=NORMAL_RADIUS, max_nn=30))
-    plane_model, inliers = pcd_down.segment_plane(
-        distance_threshold=0.01, ransac_n=3, num_iterations=1000)
-    [a, b, c, d] = plane_model
-    print(f"[scene | plane] {a:.2f}x + {b:.2f}y + {c:.2f}z + {d:.2f} = 0")
-    print(f"[scene | plane] {len(inliers):,} puntos eliminados")
-    pcd_clean = pcd_down.select_by_index(inliers, invert=True)
-    print(f"[scene | clean] {len(pcd_clean.points):,} puntos útiles\n")
-    return pcd_clean
-
-def preprocess_object(name, pcd_path, voxel_size):
-    pcd = o3d.io.read_point_cloud(pcd_path)
-    print(f"[{name:10} | load]  {len(pcd.points):,} puntos originales")
-    pcd_down = pcd.voxel_down_sample(voxel_size=voxel_size)
-    print(f"[{name:10} | voxel] {len(pcd_down.points):,} puntos tras downsampling")
-    pcd_down.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(
-            radius=NORMAL_RADIUS, max_nn=30))
-    print(f"[{name:10} | clean] {len(pcd_down.points):,} puntos útiles\n")
-    return pcd_down
-
-def extract_keypoints(name, pcd, voxel_size):
-    keypoints = pcd.uniform_down_sample(every_k_points=5)
-    print(f"[{name:10} | uniform] {len(keypoints.points):,} keypoints")
-    return keypoints
-
-def compute_fpfh(name, keypoints, fpfh_radius):
+        o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
+    
     fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-        keypoints,
-        o3d.geometry.KDTreeSearchParamRadius(radius=fpfh_radius)
-    )
-    print(f"[{name:10} | fpfh] shape={np.array(fpfh.data).shape}  "
-          f"radio={fpfh_radius*1000:.1f}mm")
-    return fpfh
+        pcd_down,
+        o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 5, max_nn=100))
+    return pcd_down, fpfh
 
-def compute_correspondences(name, obj_kp, obj_fpfh, scene_kp, scene_fpfh):
-    obj_desc   = np.array(obj_fpfh.data).T
-    scene_desc = np.array(scene_fpfh.data).T
-    scene_tree = o3d.geometry.KDTreeFlann(scene_fpfh)
-    obj_tree   = o3d.geometry.KDTreeFlann(obj_fpfh)
-    correspondences = []
-    for i in range(len(obj_desc)):
-        _, idx_in_scene, _ = scene_tree.search_knn_vector_xd(obj_desc[i], 1)
-        j = idx_in_scene[0]
-        _, idx_in_obj, _ = obj_tree.search_knn_vector_xd(scene_desc[j], 1)
-        if idx_in_obj[0] == i:
-            correspondences.append([i, j])
-    corr = np.array(correspondences) if correspondences else np.empty((0, 2), dtype=int)
-    print(f"[{name:10} | corr] {len(corr)} correspondencias mutuas "
-          f"(de {len(obj_desc)} keypoints del objeto)")
-    return corr
+def execute_registration(source_down, target_down, source_fpfh, target_fpfh, voxel_size):
+    """ Pipeline de registro: RANSAC + ICP Plane + ICP Point """
+    
+    # 1. Registro Global (RANSAC)
+    dist_ransac = voxel_size * 1.5
+    res_ransac = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+        source_down, target_down, source_fpfh, target_fpfh, True, dist_ransac,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(False), 4,
+        [o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(dist_ransac)],
+        o3d.pipelines.registration.RANSACConvergenceCriteria(4000000, 500))
 
+    # 2. Refinamiento ICP Paso 1 (Point-to-Plane)
+    res_plane = o3d.pipelines.registration.registration_icp(
+        source_down, target_down, voxel_size * 3, res_ransac.transformation,
+        o3d.pipelines.registration.TransformationEstimationPointToPlane())
 
+    # 3. Refinamiento ICP Paso 2 (Point-to-Point)
+    res_final = o3d.pipelines.registration.registration_icp(
+        source_down, target_down, voxel_size * 1.5, res_plane.transformation,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint())
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+    return res_final
+
+def main():
+    voxel_size = 0.005
+    
+    # Cargar escena y preparar versión para registro
+    scene = o3d.io.read_point_cloud(SCENE_PATH)
+    scene_clean = remove_planes(scene)
+    scene_down, scene_fpfh = preprocess(scene_clean, voxel_size)
+
+    # Lista para visualización (empezamos con la escena original)
+    visualizacion = [scene]
+
+    for name, path in OBJECT_PATHS.items():
+        print(f"\n--- Procesando: {name} ---")
+        
+        # Cargar y preparar objeto
+        obj = o3d.io.read_point_cloud(path)
+        obj_down, obj_fpfh = preprocess(obj, voxel_size)
+
+        # Registro
+        result = execute_registration(obj_down, scene_down, obj_fpfh, scene_fpfh, voxel_size)
+
+        # Métricas
+        eval_metrics = o3d.pipelines.registration.evaluate_registration(
+            obj_down, scene_down, voxel_size * 1.5, result.transformation)
+        print(f"  Fitness: {eval_metrics.fitness:.4f} | RMSE: {eval_metrics.inlier_rmse:.6f}")
+
+        # Aplicar transformación al objeto original (mantiene sus colores originales)
+        obj.transform(result.transformation)
+        visualizacion.append(obj)
+
+    print("\nAbriendo visor 3D ...")
+    o3d.visualization.draw_geometries(visualizacion, window_name="Registro Final: Colores Originales")
+
 if __name__ == "__main__":
-
-    # --- Pasos 1-2 ---
-    scene_clean = preprocess_scene(SCENE_PATH, VOXEL_SIZE_SCENE)
-    objects_clean = {name: preprocess_object(name, path, VOXEL_SIZE_OBJECT)
-                     for name, path in OBJECT_PATHS.items()}
-
-    print("─" * 50)
-    scene_kp = extract_keypoints("scene", scene_clean, VOXEL_SIZE_SCENE)
-    objects_kp = {name: extract_keypoints(name, pcd, VOXEL_SIZE_OBJECT)
-                  for name, pcd in objects_clean.items()}
-
-    # --- Paso 3 ---
-    print("─" * 50)
-    scene_fpfh   = compute_fpfh("scene", scene_kp, FPFH_RADIUS)
-    objects_fpfh = {name: compute_fpfh(name, objects_kp[name], FPFH_RADIUS)
-                    for name in OBJECT_PATHS}
-
-    # --- Paso 4 ---
-    print("─" * 50)
-    correspondences = {}
-    for name in OBJECT_PATHS:
-        corr = compute_correspondences(
-            name,
-            objects_kp[name], objects_fpfh[name],
-            scene_kp, scene_fpfh
-        )
-        correspondences[name] = corr
+    main()
