@@ -4,6 +4,8 @@ import numpy as np
 # ─── Configuración central ───────────────────────────────────────────────────
 VOXEL_SIZE_SCENE  = 0.005
 VOXEL_SIZE_OBJECT = 0.001
+FPFH_RADIUS       = 0.015
+NORMAL_RADIUS     = 0.01
 
 SCENE_PATH = "clouds/scenes/snap_0point.pcd"
 
@@ -14,7 +16,7 @@ OBJECT_PATHS = {
     "plc":       "clouds/objects/s0_plc_corr.pcd",
 }
 
-# ─── Pasos 1 y 2 (igual que antes) ───────────────────────────────────────────
+# ─── Pasos 1-4 (igual que antes) ─────────────────────────────────────────────
 def preprocess_scene(pcd_path, voxel_size):
     pcd = o3d.io.read_point_cloud(pcd_path)
     print(f"[scene | load]  {len(pcd.points):,} puntos originales")
@@ -22,7 +24,7 @@ def preprocess_scene(pcd_path, voxel_size):
     print(f"[scene | voxel] {len(pcd_down.points):,} puntos tras downsampling")
     pcd_down.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(
-            radius=voxel_size * 2, max_nn=30))
+            radius=NORMAL_RADIUS, max_nn=30))
     plane_model, inliers = pcd_down.segment_plane(
         distance_threshold=0.01, ransac_n=3, num_iterations=1000)
     [a, b, c, d] = plane_model
@@ -39,62 +41,47 @@ def preprocess_object(name, pcd_path, voxel_size):
     print(f"[{name:10} | voxel] {len(pcd_down.points):,} puntos tras downsampling")
     pcd_down.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(
-            radius=voxel_size * 2, max_nn=30))
+            radius=NORMAL_RADIUS, max_nn=30))
     print(f"[{name:10} | clean] {len(pcd_down.points):,} puntos útiles\n")
     return pcd_down
 
 def extract_keypoints(name, pcd, voxel_size):
-    keypoints = o3d.geometry.keypoint.compute_iss_keypoints(
-        pcd,
-        salient_radius=voxel_size * 6,
-        non_max_radius=voxel_size * 4,
-        gamma_21=0.975,
-        gamma_32=0.975,
-    )
-    ratio = len(keypoints.points) / len(pcd.points) * 100
-    print(f"[{name:10} | iss] {len(keypoints.points):,} keypoints "
-          f"({ratio:.1f}% de {len(pcd.points):,})")
+    keypoints = pcd.uniform_down_sample(every_k_points=5)
+    print(f"[{name:10} | uniform] {len(keypoints.points):,} keypoints")
     return keypoints
 
-# ─── Paso 3: Descriptores FPFH ────────────────────────────────────────────────
-def compute_fpfh(name, pcd_full, keypoints, voxel_size):
-    """
-    Calcula descriptores FPFH solo sobre los keypoints,
-    pero usando la nube completa para buscar vecinos.
-
-    Por qué pcd_full y no solo keypoints:
-      FPFH necesita vecinos reales alrededor de cada keypoint.
-      Si solo le damos los keypoints, la vecindad queda vacía
-      y el histograma sale plano e inútil.
-
-    Args:
-        pcd_full   : nube completa preprocesada (con normales)
-        keypoints  : puntos clave extraídos por ISS
-        voxel_size : para calcular el radio del descriptor
-
-    Returns:
-        fpfh : objeto Feature con matriz (33, N_keypoints)
-    """
-    # El radio debe ser > radio de normales (voxel_size*2)
-    # Usamos voxel_size*5 como regla general segura
-    radius_feature = voxel_size * 5
-
+def compute_fpfh(name, keypoints, fpfh_radius):
     fpfh = o3d.pipelines.registration.compute_fpfh_feature(
         keypoints,
-        o3d.geometry.KDTreeSearchParamRadius(radius=radius_feature)
+        o3d.geometry.KDTreeSearchParamRadius(radius=fpfh_radius)
     )
-
-    # fpfh.data es una matriz numpy de shape (33, N_keypoints)
     print(f"[{name:10} | fpfh] shape={np.array(fpfh.data).shape}  "
-          f"radio={radius_feature*1000:.1f}mm")
-
+          f"radio={fpfh_radius*1000:.1f}mm")
     return fpfh
+
+def compute_correspondences(name, obj_kp, obj_fpfh, scene_kp, scene_fpfh):
+    obj_desc   = np.array(obj_fpfh.data).T
+    scene_desc = np.array(scene_fpfh.data).T
+    scene_tree = o3d.geometry.KDTreeFlann(scene_fpfh)
+    obj_tree   = o3d.geometry.KDTreeFlann(obj_fpfh)
+    correspondences = []
+    for i in range(len(obj_desc)):
+        _, idx_in_scene, _ = scene_tree.search_knn_vector_xd(obj_desc[i], 1)
+        j = idx_in_scene[0]
+        _, idx_in_obj, _ = obj_tree.search_knn_vector_xd(scene_desc[j], 1)
+        if idx_in_obj[0] == i:
+            correspondences.append([i, j])
+    corr = np.array(correspondences) if correspondences else np.empty((0, 2), dtype=int)
+    print(f"[{name:10} | corr] {len(corr)} correspondencias mutuas "
+          f"(de {len(obj_desc)} keypoints del objeto)")
+    return corr
+
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
 
-    # --- Pasos 1 y 2 ---
+    # --- Pasos 1-2 ---
     scene_clean = preprocess_scene(SCENE_PATH, VOXEL_SIZE_SCENE)
     objects_clean = {name: preprocess_object(name, path, VOXEL_SIZE_OBJECT)
                      for name, path in OBJECT_PATHS.items()}
@@ -104,16 +91,19 @@ if __name__ == "__main__":
     objects_kp = {name: extract_keypoints(name, pcd, VOXEL_SIZE_OBJECT)
                   for name, pcd in objects_clean.items()}
 
-    # --- Paso 3: FPFH ---
+    # --- Paso 3 ---
     print("─" * 50)
-    scene_fpfh = compute_fpfh("scene", scene_clean, scene_kp, VOXEL_SIZE_SCENE)
-    objects_fpfh = {name: compute_fpfh(name, objects_clean[name], objects_kp[name], VOXEL_SIZE_OBJECT)
+    scene_fpfh   = compute_fpfh("scene", scene_kp, FPFH_RADIUS)
+    objects_fpfh = {name: compute_fpfh(name, objects_kp[name], FPFH_RADIUS)
                     for name in OBJECT_PATHS}
-    
-    print("\nVisualizando escena con keypoints (rojo)...")
-    scene_kp_vis = o3d.geometry.PointCloud(scene_kp)
-    scene_kp_vis.paint_uniform_color([1.0, 0.1, 0.1])
-    o3d.visualization.draw_geometries(
-        [scene_clean, scene_kp_vis],
-        window_name="Escena — keypoints ISS"
-    )
+
+    # --- Paso 4 ---
+    print("─" * 50)
+    correspondences = {}
+    for name in OBJECT_PATHS:
+        corr = compute_correspondences(
+            name,
+            objects_kp[name], objects_fpfh[name],
+            scene_kp, scene_fpfh
+        )
+        correspondences[name] = corr
