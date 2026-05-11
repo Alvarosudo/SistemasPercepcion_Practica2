@@ -2,6 +2,8 @@ import open3d as o3d
 import numpy as np
 import copy
 import os
+import time # Añadir en los imports
+
 
 def preprocess_point_cloud(pcd, voxel_size,vecindad_normal,vecindad_descriptores, max_norm, max_vecin):
     """
@@ -24,36 +26,34 @@ def preprocess_point_cloud(pcd, voxel_size,vecindad_normal,vecindad_descriptores
     
     return pcd_down, pcd_fpfh
 
-def execute_global_registration(source_down, target_down, source_fpfh, target_fpfh, voxel_size):
+def execute_global_registration(source_down, target_down, source_fpfh, target_fpfh, voxel_size,umbral):
     """
     Alineación global inicial (Coarse alignment) usando RANSAC.
     """
-    distance_threshold = voxel_size * 1.5
-    print(f"    -> Ejecutando RANSAC (Alineamiento global). Umbral de distancia: {distance_threshold}")
+    print(f"    -> Ejecutando RANSAC (Alineamiento global). Umbral de distancia: {umbral}")
     
     # RANSAC para alinear basándose en el emparejamiento de las características FPFH
     result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
         source_down, target_down, source_fpfh, target_fpfh, True,
-        distance_threshold,
+        umbral,
         o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
         3, [
             # Comprobaciones para asegurar que los emparejamientos son lógicos geométricamente
             o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
-            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(distance_threshold)
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(umbral)
         ], o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999))
     
     return result
 
-def refine_registration(source_down, target_down, initial_transform, voxel_size):
+def refine_registration(source_down, target_down, initial_transform, voxel_size,umbral):
     """
     Refinamiento local (Fine alignment) usando ICP (Iterative Closest Point).
     """
-    distance_threshold = voxel_size * 0.4
-    print(f"    -> Ejecutando ICP (Refinamiento). Umbral de distancia: {distance_threshold}")
+    print(f"    -> Ejecutando ICP (Refinamiento). Umbral de distancia: {umbral}")
     
     # ICP (Point-to-Plane suele converger mejor y más rápido que Point-to-Point)
     result = o3d.pipelines.registration.registration_icp(
-        source_down, target_down, distance_threshold, initial_transform,
+        source_down, target_down, umbral, initial_transform,
         o3d.pipelines.registration.TransformationEstimationPointToPlane())
     
     return result
@@ -94,22 +94,9 @@ def main():
     VECIN_DESC_MAX = 100 #Maximo de vecinos de los descriptores
 
     SAMPLES_RANSAC = 3 #Numero de samples para RANSAC
-    UMBRAL_RANSAC = 2 #Umbral de aceptacion para ransac
-    UMBRAL_ICP = 2 #Umbral de aceptacion para icp
+    UMBRAL_RANSAC = VOXEL_SIZE * 1.5 #Umbral de aceptacion para ransac
+    UMBRAL_ICP = VOXEL_SIZE * 0.4 #Umbral de aceptacion para icp
 
-
-
-
-    vecinidad calculo de normales: radius_normal
-maximo vecinos normales: max_nn
-
-vecinidad calculo de descriptores:radius_feature
-maximo vecinos descriptores: max_nn
-
-Numero de samples para RANSAC: ransac_n
-umbral de aceptacion para RANSAC: distance_threshold
-
-Umbral de acepctación para ICP: distance_threshold 
 
     print("=== 1. CARGANDO Y PREPROCESANDO LA ESCENA ===")
     scene = o3d.io.read_point_cloud(SCENE_PATH)
@@ -121,7 +108,7 @@ Umbral de acepctación para ICP: distance_threshold
     print("-> Eliminando el plano dominante de la escena (RANSAC plano)")
     # distance_threshold: tolerancia de distancia al plano
     plane_model, inliers = scene.segment_plane(distance_threshold=0.015,
-                                               ransac_n=3,
+                                               ransac_n=SAMPLES_RANSAC,
                                                num_iterations=1000)
     
     # Nos quedamos con la escena SIN el plano (invert=True)
@@ -156,15 +143,20 @@ Umbral de acepctación para ICP: distance_threshold
         obj = o3d.io.read_point_cloud(obj_path)
         obj = obj.remove_non_finite_points()
 
+        #ANADIDO POR EL TIEMPO
+        start_time = time.time()
+
         # 2. Preprocesar el objeto (downsample, normales, FPFH)
-        obj_down, obj_fpfh = preprocess_point_cloud(obj, VOXEL_SIZE)
+        obj_down, obj_fpfh = preprocess_point_cloud(obj, VOXEL_SIZE, VECINDAD_NORMAL,VECINDAD_DESCRIPTORES,VECIN_NORM_MAX,VECIN_DESC_MAX)
 
         # 3. Alineamiento global con RANSAC
-        result_ransac = execute_global_registration(obj_down, scene_down, obj_fpfh, scene_fpfh, VOXEL_SIZE)
+        result_ransac = execute_global_registration(obj_down, scene_down, obj_fpfh, scene_fpfh, VOXEL_SIZE, UMBRAL_RANSAC)
         
         # 4. Refinamiento con ICP
-        result_icp = refine_registration(obj_down, scene_down, result_ransac.transformation, VOXEL_SIZE)
+        result_icp = refine_registration(obj_down, scene_down, result_ransac.transformation, VOXEL_SIZE,UMBRAL_ICP)
         
+        end_time = time.time()
+        print(f"    -> Tiempo de PREPROCESADO + RANSAC + ICP: {end_time - start_time:.4f} segundos")
         print(f"    -> Fitness (Puntuación de encaje): {result_icp.fitness:.4f}")
 
         # 5. Transformar la nube original del objeto y pintarla
@@ -181,3 +173,6 @@ Umbral de acepctación para ICP: distance_threshold
     #o3d.visualization.draw_geometries([scene], window_name="Reconocimiento de Objetos 3D", width=1024, height=768)
 if __name__ == "__main__":
     main()
+
+
+    #que pasa si elimino el detector de keypoints
