@@ -157,7 +157,8 @@ def main():
         
         end_time = time.time()
         print(f"    -> Tiempo de PREPROCESADO + RANSAC + ICP: {end_time - start_time:.4f} segundos")
-        print(f"    -> Fitness (Puntuación de encaje): {result_icp.fitness:.4f}")
+        print(f"    -> Fitness (Puntuación de encaje,buscamos 1.0): {result_icp.fitness:.4f}")
+        print(f"    -> RMSE (Error cuadrático medio,buscamos 0.0): {result_icp.inlier_rmse:.6f}")
 
         # 5. Transformar la nube original del objeto y pintarla
         obj_matched = copy.deepcopy(obj)
@@ -176,3 +177,5 @@ if __name__ == "__main__":
 
 
     #que pasa si elimino el detector de keypoints
+
+    #segmentacion para el charmander, en el eje x, y o z, luego para la panoramica no todas funcionan porque son planos eso se explica en la memoria
